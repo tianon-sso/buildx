@@ -88,6 +88,7 @@ type Options struct {
 	Target                     string
 	Ulimits                    *opts.UlimitOpt
 
+	IntermediateImages     bool
 	Session                []session.Attachable
 	Linked                 bool // Linked marks this target as exclusively linked (not requested by the user).
 	CallFunc               *CallFunc

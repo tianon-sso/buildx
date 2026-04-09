@@ -96,12 +96,13 @@ type buildOptions struct {
 	progress string
 	quiet    bool
 
-	builder      string
-	metadataFile string
-	noCache      bool
-	pull         bool
-	exportPush   bool
-	exportLoad   bool
+	builder            string
+	metadataFile       string
+	noCache            bool
+	pull               bool
+	exportPush         bool
+	exportLoad         bool
+	intermediateImages bool
 }
 
 func (o *buildOptions) toOptions() (*BuildOptions, error) {
@@ -118,26 +119,27 @@ func (o *buildOptions) toOptions() (*BuildOptions, error) {
 	}
 
 	opts := BuildOptions{
-		Allow:          o.allow,
-		Annotations:    o.annotations,
-		BuildArgs:      buildArgs,
-		CgroupParent:   o.cgroupParent,
-		ContextPath:    o.contextPath,
-		DockerfileName: o.dockerfileName,
-		ExtraHosts:     o.extraHosts,
-		Labels:         labels,
-		NetworkMode:    o.networkMode,
-		NoCacheFilter:  o.noCacheFilter,
-		Platforms:      o.platforms,
-		ShmSize:        int64(o.shmSize),
-		Tags:           o.tags,
-		Target:         o.target,
-		Ulimits:        o.ulimits,
-		Builder:        o.builder,
-		NoCache:        o.noCache,
-		Pull:           o.pull,
-		ExportPush:     o.exportPush,
-		ExportLoad:     o.exportLoad,
+		Allow:              o.allow,
+		Annotations:        o.annotations,
+		BuildArgs:          buildArgs,
+		CgroupParent:       o.cgroupParent,
+		ContextPath:        o.contextPath,
+		DockerfileName:     o.dockerfileName,
+		ExtraHosts:         o.extraHosts,
+		Labels:             labels,
+		NetworkMode:        o.networkMode,
+		NoCacheFilter:      o.noCacheFilter,
+		Platforms:          o.platforms,
+		ShmSize:            int64(o.shmSize),
+		Tags:               o.tags,
+		Target:             o.target,
+		Ulimits:            o.ulimits,
+		Builder:            o.builder,
+		NoCache:            o.noCache,
+		Pull:               o.pull,
+		ExportPush:         o.exportPush,
+		ExportLoad:         o.exportLoad,
+		IntermediateImages: o.intermediateImages,
 	}
 
 	if _, ok := opts.BuildArgs[epoch.SourceDateEpochEnv]; !ok {
@@ -553,6 +555,8 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugger debuggerOpt
 	flags.StringVar(&options.imageIDFile, "iidfile", "", "Write the image ID to a file")
 
 	flags.StringArrayVar(&options.labels, "label", []string{}, "Set metadata for an image")
+
+	flags.BoolVar(&options.intermediateImages, "intermediate-images", false, "Export an image for each successful build step (useful for debugging failing steps)")
 
 	flags.BoolVar(&options.exportLoad, "load", false, `Shorthand for "--output=type=docker"`)
 
@@ -995,6 +999,7 @@ type BuildOptions struct {
 	Pull                   bool
 	ExportPush             bool
 	ExportLoad             bool
+	IntermediateImages     bool
 	SourcePolicy           *sourcepolicy.Policy
 	Ref                    string
 	GroupRef               string
@@ -1036,6 +1041,7 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in *BuildOptions, inSt
 		Ulimits:                in.Ulimits,
 		GroupRef:               in.GroupRef,
 		ProvenanceResponseMode: confutil.ParseMetadataProvenance(in.ProvenanceResponseMode),
+		IntermediateImages:     in.IntermediateImages,
 	}
 
 	platforms, err := platformutil.Parse(in.Platforms)

@@ -588,6 +588,16 @@ func toSolveOpt(ctx context.Context, np *noderesolver.ResolvedNode, multiDriver 
 		so.Internal = true
 	}
 
+	if opt.IntermediateImages {
+		so.FrontendAttrs["intermediate-images"] = "true"
+		if docker != nil {
+			so.IntermediateImageOutput = func(_ map[string]string) (io.WriteCloser, error) {
+				w, _, err := docker.LoadImage(ctx, "", pw)
+				return w, err
+			}
+		}
+	}
+
 	return &so, releaseF, nil
 }
 
