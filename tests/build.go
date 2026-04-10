@@ -86,6 +86,7 @@ var buildTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuildExtraHosts,
 	testBuildIndexAnnotationsLoadDocker,
 	testBuildIntermediateImages,
+	testBuildIntermediateImagesOnFailure,
 }
 
 func testBuild(t *testing.T, sb integration.Sandbox) {
@@ -1669,6 +1670,33 @@ RUN touch /step2
 		require.NoError(t, err, out)
 	})
 
+	t.Run("docker-load", func(t *testing.T) {
+		if sb.DockerAddress() == "" {
+			t.Skip("streaming intermediate images requires a Docker daemon")
+		}
+		// Verify that intermediate-image streaming works alongside --load,
+		// including when buildkitd is running inside a container (docker-container
+		// driver). Both paths go over the gRPC session, so this exercises the
+		// full transport from containerized buildkitd to the local Docker daemon.
+		tag := "buildx-test-intermediate:" + identity.NewID()
+		t.Cleanup(func() {
+			cmd := dockerCmd(sb, withArgs("image", "rm", "--force", tag))
+			cmd.Stderr = os.Stderr
+			cmd.Run() //nolint:errcheck
+		})
+		out, err := buildCmd(sb, withArgs("--intermediate-images", "--load", "-t="+tag, dir))
+		require.NoError(t, err, out)
+		cmd := dockerCmd(sb, withArgs("image", "inspect", tag))
+		cmd.Stderr = os.Stderr
+		require.NoError(t, cmd.Run(), "final image should be present in Docker after --load")
+		// TODO: verify that the intermediate images were actually loaded into
+		// Docker (not just the final image). Currently --intermediate-images
+		// streams each step's tar via LoadImage but the loaded image IDs are not
+		// returned to the caller, so there is no handle to inspect them here.
+		// Once the streaming path surfaces the loaded image IDs or digest list,
+		// add assertions like: dockerCmd inspect <step-image-id> for each step.
+	})
+
 	t.Run("oci", func(t *testing.T) {
 		// checkIntermediateAnnotations verifies that the index contains the
 		// expected final image plus one manifest per intermediate RUN step,
@@ -1779,6 +1807,26 @@ RUN touch /step2
 			})
 		})
 	})
+}
+
+func testBuildIntermediateImagesOnFailure(t *testing.T, sb integration.Sandbox) {
+	if sb.DockerAddress() == "" {
+		t.Skip("streaming intermediate images requires a Docker daemon")
+	}
+	// step1 succeeds, step2 fails. The failing step should still produce an
+	// intermediate image so users can inspect the filesystem at failure time.
+	dockerfile := []byte(`FROM busybox:latest
+RUN touch /step1
+RUN false
+`)
+	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
+	out, err := buildCmd(sb, withArgs("--no-cache", "--intermediate-images", dir))
+	require.Error(t, err, "expected build to fail")
+	// The build output should mention both steps were processed; the exact
+	// assertion here is just that the command failed rather than panicked or
+	// hung. The intermediate images themselves are validated in the lower-level
+	// client integration test (testIntermediateImagesOnFailure).
+	_ = out
 }
 
 func createTestProject(t *testing.T) string {
