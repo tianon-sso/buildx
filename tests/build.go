@@ -86,7 +86,6 @@ var buildTests = []func(t *testing.T, sb integration.Sandbox){
 	testBuildExtraHosts,
 	testBuildIndexAnnotationsLoadDocker,
 	testBuildIntermediateImages,
-	testBuildIntermediateImagesOnFailure,
 }
 
 func testBuild(t *testing.T, sb integration.Sandbox) {
@@ -1655,267 +1654,221 @@ func testBuildIndexAnnotationsLoadDocker(t *testing.T, sb integration.Sandbox) {
 }
 
 func testBuildIntermediateImages(t *testing.T, sb integration.Sandbox) {
-	dockerfile := []byte(`FROM busybox:latest
-RUN touch /step1
-RUN touch /step2
-`)
-	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
-
-	t.Run("docker", func(t *testing.T) {
-		if sb.DockerAddress() == "" {
-			t.Skip("streaming intermediate images requires a Docker daemon")
-		}
-		// Stream each step's image to the Docker daemon via LoadImage.
-		out, err := buildCmd(sb, withArgs("--intermediate-images", dir))
-		require.NoError(t, err, out)
-	})
-
-	t.Run("docker-load", func(t *testing.T) {
-		if sb.DockerAddress() == "" {
-			t.Skip("streaming intermediate images requires a Docker daemon")
-		}
-		// Verify that intermediate-image streaming works alongside --load,
-		// including when buildkitd is running inside a container (docker-container
-		// driver). Both paths go over the gRPC session, so this exercises the
-		// full transport from containerized buildkitd to the local Docker daemon.
-		tag := "buildx-test-intermediate:" + identity.NewID()
-		t.Cleanup(func() {
-			cmd := dockerCmd(sb, withArgs("image", "rm", "--force", tag))
-			cmd.Stderr = os.Stderr
-			cmd.Run() //nolint:errcheck
-		})
-		out, err := buildCmd(sb, withArgs("--intermediate-images", "--load", "-t="+tag, dir))
-		require.NoError(t, err, out)
-		cmd := dockerCmd(sb, withArgs("image", "inspect", tag))
-		cmd.Stderr = os.Stderr
-		require.NoError(t, cmd.Run(), "final image should be present in Docker after --load")
-		// TODO: verify that the intermediate images were actually loaded into
-		// Docker (not just the final image). Currently --intermediate-images
-		// streams each step's tar via LoadImage but the loaded image IDs are not
-		// returned to the caller, so there is no handle to inspect them here.
-		// Once the streaming path surfaces the loaded image IDs or digest list,
-		// add assertions like: dockerCmd inspect <step-image-id> for each step.
-	})
-
-	t.Run("oci", func(t *testing.T) {
-		// TODO: remove these skips once intermediate OCI images are supported
-		// by all workers. This requires:
-		//  - docker worker: wait until our changes ship in a Docker release
-		//  - docker-container/remote workers: use CheckFeatureCompat with an
-		//    explicit feature flag exposed by buildkitd (as in the buildkit
-		//    client tests); in the meantime, set TEST_BUILDKITD_BIN=/path/to/
-		//    buildkitd to inject a locally built binary into the container.
-		if isDockerWorker(sb) {
-			t.Skip("docker worker uses Docker's embedded BuildKit which does not yet support intermediate OCI images")
-		}
-		// checkIntermediateAnnotations verifies that the index contains the
-		// expected final image plus one manifest per intermediate RUN step,
-		// and that each intermediate manifest carries the
-		// moby.buildkit.intermediate.index (values "0", "1", ...) and
-		// moby.buildkit.intermediate.command annotations on both the index
-		// descriptor and (via readBlob) the manifest blob itself. It also
-		// asserts that no descriptor leaks the internal config.digest annotation.
-		checkIntermediateAnnotations := func(t *testing.T, manifests []json.RawMessage, readBlob func(digest.Digest) []byte) {
-			t.Helper()
-			require.Equal(t, 3, len(manifests), "expected final image plus two intermediate step images in OCI index")
-
-			expectedCommands := map[string]string{
+	cases := []struct {
+		// name is used as the t.Run subtest name.
+		name string
+		// dockerfile is the Dockerfile content for this case.
+		dockerfile string
+		// expectError indicates the build is expected to fail (e.g. RUN false).
+		expectError bool
+		// expectedCmds maps intermediate step index ("0", "1", ...) to the
+		// expected command annotation value.
+		expectedCmds map[string]string
+	}{
+		{
+			name: "success",
+			dockerfile: `
+				FROM busybox:latest
+				RUN touch /step1
+				RUN touch /step2
+			`,
+			expectedCmds: map[string]string{
 				"0": "/bin/sh -c touch /step1",
 				"1": "/bin/sh -c touch /step2",
-			}
-			stepsSeen := map[string]bool{}
-			for _, raw := range manifests {
-				var desc ocispecs.Descriptor
-				require.NoError(t, json.Unmarshal(raw, &desc))
+			},
+		},
+		{
+			// step1 succeeds, step2 fails. The failing step should still
+			// produce an intermediate image so users can inspect the
+			// filesystem at failure time.
+			name: "failure",
+			dockerfile: `
+				FROM busybox:latest
+				RUN touch /step1
+				RUN false
+			`,
+			expectError: true,
+			expectedCmds: map[string]string{
+				"0": "/bin/sh -c touch /step1",
+				"1": "/bin/sh -c false",
+			},
+		},
+	}
 
-				require.NotContains(t, desc.Annotations, exptypes.ExporterConfigDigestKey,
-					"config.digest must not leak onto index descriptors")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tmpdir(t, fstest.CreateFile("Dockerfile", []byte(tc.dockerfile), 0o600))
 
-				stepIdx, ok := desc.Annotations[exptypes.ExporterIntermediateIndexKey]
-				if !ok {
-					continue // final image — no intermediate-index annotation expected
+			t.Run("docker-load", func(t *testing.T) {
+				if sb.DockerAddress() == "" {
+					t.Skip("streaming intermediate images requires a Docker daemon")
 				}
-				require.False(t, stepsSeen[stepIdx], "duplicate step index %q in index", stepIdx)
-				stepsSeen[stepIdx] = true
-
-				require.Equal(t, expectedCommands[stepIdx],
-					desc.Annotations[exptypes.ExporterIntermediateStepCommandKey],
-					"command annotation mismatch on index descriptor for step %q", stepIdx)
-
-				// Verify both annotations are embedded in the manifest blob.
-				var mfst ocispecs.Manifest
-				require.NoError(t, json.Unmarshal(readBlob(desc.Digest), &mfst))
-				require.Equal(t, stepIdx, mfst.Annotations[exptypes.ExporterIntermediateIndexKey],
-					"manifest blob step annotation mismatch for step %q", stepIdx)
-				require.Equal(t, expectedCommands[stepIdx],
-					mfst.Annotations[exptypes.ExporterIntermediateStepCommandKey],
-					"manifest blob command annotation mismatch for step %q", stepIdx)
-			}
-			for _, expected := range []string{"0", "1"} {
-				require.True(t, stepsSeen[expected], "missing intermediate step index %q in index", expected)
-			}
-		}
-
-		t.Run("tar", func(t *testing.T) {
-			dest := filepath.Join(t.TempDir(), "result.tar")
-			out, err := buildCmd(sb, withArgs(
-				"--no-cache",
-				"--intermediate-images",
-				fmt.Sprintf("--output=type=oci,dest=%s", dest),
-				dir,
-			))
-			require.NoError(t, err, out)
-
-			f, err := os.Open(dest)
-			require.NoError(t, err)
-			defer f.Close()
-
-			var idx struct {
-				Manifests []json.RawMessage `json:"manifests"`
-			}
-			blobs := map[string][]byte{}
-			tr := tar.NewReader(f)
-			for {
-				hdr, err := tr.Next()
-				if err == io.EOF {
-					break
-				}
-				require.NoError(t, err)
-				dt, err := io.ReadAll(tr)
-				require.NoError(t, err)
-				if hdr.Name == "index.json" {
-					require.NoError(t, json.Unmarshal(dt, &idx))
+				// Verify that intermediate-image streaming works alongside
+				// --load, including when buildkitd is running inside a
+				// container (docker-container driver). Both paths go over
+				// the gRPC session, exercising the full transport from a
+				// containerized buildkitd to the local Docker daemon.
+				tag := "buildx-test-intermediate:" + identity.NewID()
+				out, err := buildCmd(sb, withArgs("--no-cache", "--intermediate-images", "--load", "-t="+tag, dir))
+				if tc.expectError {
+					require.Error(t, err, "expected build to fail")
+					_ = out
 				} else {
-					blobs[hdr.Name] = dt
+					require.NoError(t, err, out)
+					t.Cleanup(func() {
+						cmd := dockerCmd(sb, withArgs("image", "rm", tag))
+						cmd.Stderr = os.Stderr
+						require.NoError(t, cmd.Run())
+					})
+					cmd := dockerCmd(sb, withArgs("image", "inspect", tag))
+					cmd.Stderr = os.Stderr
+					require.NoError(t, cmd.Run(), "final image should be present in Docker after --load")
 				}
-			}
-			checkIntermediateAnnotations(t, idx.Manifests, func(dgst digest.Digest) []byte {
-				return blobs["blobs/"+dgst.Algorithm().String()+"/"+dgst.Encoded()]
+				// TODO: verify that intermediate images for each step were
+				// loaded into Docker in both the success and failure cases.
+				// Currently the loaded image IDs are not returned to the
+				// caller. Once the streaming path surfaces loaded IDs or
+				// digests, assert their presence here.
 			})
-		})
 
-		t.Run("dir", func(t *testing.T) {
-			dest := t.TempDir()
-			out, err := buildCmd(sb, withArgs(
-				"--no-cache",
-				"--intermediate-images",
-				fmt.Sprintf("--output=type=oci,dest=%s,tar=false", dest),
-				dir,
-			))
-			require.NoError(t, err, out)
+			// Iterate over the two OCI output transports. Both produce the
+			// same manifest annotations; only the blob-reading logic differs.
+			for _, om := range []struct {
+				name      string
+				outFlag   string
+				readIndex func(*testing.T, string) ([]json.RawMessage, func(digest.Digest) []byte)
+			}{
+				{
+					name:    "oci-tar",
+					outFlag: "type=oci,dest=%s",
+					readIndex: func(t *testing.T, dest string) ([]json.RawMessage, func(digest.Digest) []byte) {
+						t.Helper()
+						f, err := os.Open(dest)
+						require.NoError(t, err)
+						t.Cleanup(func() { f.Close() })
+						var idx struct {
+							Manifests []json.RawMessage `json:"manifests"`
+						}
+						blobs := map[string][]byte{}
+						tr := tar.NewReader(f)
+						for {
+							hdr, err := tr.Next()
+							if err == io.EOF {
+								break
+							}
+							require.NoError(t, err)
+							dt, err := io.ReadAll(tr)
+							require.NoError(t, err)
+							if hdr.Name == "index.json" {
+								require.NoError(t, json.Unmarshal(dt, &idx))
+							} else {
+								blobs[hdr.Name] = dt
+							}
+						}
+						return idx.Manifests, func(dgst digest.Digest) []byte {
+							return blobs["blobs/"+dgst.Algorithm().String()+"/"+dgst.Encoded()]
+						}
+					},
+				},
+				{
+					name:    "oci-dir",
+					outFlag: "type=oci,dest=%s,tar=false",
+					readIndex: func(t *testing.T, dest string) ([]json.RawMessage, func(digest.Digest) []byte) {
+						t.Helper()
+						dt, err := os.ReadFile(filepath.Join(dest, "index.json"))
+						require.NoError(t, err)
+						var idx struct {
+							Manifests []json.RawMessage `json:"manifests"`
+						}
+						require.NoError(t, json.Unmarshal(dt, &idx))
+						return idx.Manifests, func(dgst digest.Digest) []byte {
+							dt, err := os.ReadFile(filepath.Join(dest, "blobs", dgst.Algorithm().String(), dgst.Encoded()))
+							require.NoError(t, err)
+							return dt
+						}
+					},
+				},
+			} {
+				t.Run(om.name, func(t *testing.T) {
+					// TODO: remove this skip once intermediate OCI images are
+					// supported by Docker's embedded BuildKit (i.e. once our
+					// changes ship in a Docker release). At that point this
+					// should use CheckFeatureCompat with an explicit feature
+					// flag exposed by buildkitd, as in the buildkit client tests.
+					if isDockerWorker(sb) {
+						t.Skip("docker worker uses Docker's embedded BuildKit which does not yet support intermediate OCI images")
+					}
+					// oci-tar requires a successful build: no tar archive is
+					// written when the build fails.
+					if tc.expectError && om.name == "oci-tar" {
+						t.Skip("oci-tar output is not produced when the build fails")
+					}
+					var dest string
+					if strings.Contains(om.outFlag, "tar=false") {
+						dest = t.TempDir()
+					} else {
+						dest = filepath.Join(t.TempDir(), "result.tar")
+					}
+					out, err := buildCmd(sb, withArgs(
+						"--no-cache", "--intermediate-images",
+						fmt.Sprintf("--output="+om.outFlag, dest),
+						dir,
+					))
+					if tc.expectError {
+						require.Error(t, err, "expected build to fail")
+						_ = out
+					} else {
+						require.NoError(t, err, out)
+					}
+					// Walk the OCI index manifests and assert that every
+					// expected step index appears with the correct command
+					// annotation on both the index descriptor and the manifest
+					// blob. On failure every manifest must carry an
+					// intermediate-index annotation; on success exactly one
+					// unannotated final image must be present alongside them.
+					manifests, readBlob := om.readIndex(t, dest)
+					stepsSeen := map[string]bool{}
+					finalCount := 0
+					for _, raw := range manifests {
+						var desc ocispecs.Descriptor
+						require.NoError(t, json.Unmarshal(raw, &desc))
 
-			dt, err := os.ReadFile(filepath.Join(dest, "index.json"))
-			require.NoError(t, err)
+						require.NotContains(t, desc.Annotations, exptypes.ExporterConfigDigestKey,
+							"config.digest must not leak onto index descriptors")
 
-			var idx struct {
-				Manifests []json.RawMessage `json:"manifests"`
+						stepIdx, ok := desc.Annotations[exptypes.ExporterIntermediateIndexKey]
+						if !ok {
+							require.False(t, tc.expectError,
+								"all manifests should be intermediate images on build failure, got unannotated manifest")
+							finalCount++
+							continue // final image — no intermediate annotation expected
+						}
+						require.False(t, stepsSeen[stepIdx], "duplicate step index %q in index", stepIdx)
+						stepsSeen[stepIdx] = true
+
+						require.Equal(t, tc.expectedCmds[stepIdx],
+							desc.Annotations[exptypes.ExporterIntermediateStepCommandKey],
+							"command annotation mismatch on index descriptor for step %q", stepIdx)
+
+						// Verify both annotations are also embedded in the manifest blob.
+						var mfst ocispecs.Manifest
+						require.NoError(t, json.Unmarshal(readBlob(desc.Digest), &mfst))
+						require.Equal(t, stepIdx, mfst.Annotations[exptypes.ExporterIntermediateIndexKey],
+							"manifest blob step annotation mismatch for step %q", stepIdx)
+						require.Equal(t, tc.expectedCmds[stepIdx],
+							mfst.Annotations[exptypes.ExporterIntermediateStepCommandKey],
+							"manifest blob command annotation mismatch for step %q", stepIdx)
+					}
+					for expected := range tc.expectedCmds {
+						require.True(t, stepsSeen[expected], "missing intermediate step index %q in index", expected)
+					}
+					if !tc.expectError {
+						require.Equal(t, 1, finalCount, "expected exactly one unannotated final image in OCI index")
+					}
+				})
 			}
-			require.NoError(t, json.Unmarshal(dt, &idx))
-			checkIntermediateAnnotations(t, idx.Manifests, func(dgst digest.Digest) []byte {
-				dt, err := os.ReadFile(filepath.Join(dest, "blobs", dgst.Algorithm().String(), dgst.Encoded()))
-				require.NoError(t, err)
-				return dt
-			})
 		})
-	})
-}
-
-func testBuildIntermediateImagesOnFailure(t *testing.T, sb integration.Sandbox) {
-	// step1 succeeds, step2 fails. The failing step should still produce an
-	// intermediate image so users can inspect the filesystem at failure time.
-	dockerfile := []byte(`FROM busybox:latest
-RUN touch /step1
-RUN false
-`)
-	dir := tmpdir(t, fstest.CreateFile("Dockerfile", dockerfile, 0o600))
-
-	t.Run("docker", func(t *testing.T) {
-		if sb.DockerAddress() == "" {
-			t.Skip("streaming intermediate images requires a Docker daemon")
-		}
-		out, err := buildCmd(sb, withArgs("--no-cache", "--intermediate-images", dir))
-		require.Error(t, err, "expected build to fail")
-		// TODO: verify that intermediate images for each step (including the
-		// failing step) actually appeared in the Docker daemon. Currently
-		// --intermediate-images streams each step's tar via LoadImage but the
-		// loaded image IDs are not returned to the caller, so there is no
-		// handle to inspect them here. Once the streaming path surfaces the
-		// loaded image IDs or digest list, add assertions like:
-		// dockerCmd inspect <step-image-id> for each step.
-		_ = out
-	})
-
-	t.Run("oci", func(t *testing.T) {
-		// TODO: remove these skips once intermediate OCI images are supported
-		// by all workers. This requires:
-		//  - docker worker: wait until our changes ship in a Docker release
-		//  - docker-container/remote workers: use CheckFeatureCompat with an
-		//    explicit feature flag exposed by buildkitd (as in the buildkit
-		//    client tests); in the meantime, set TEST_BUILDKITD_BIN=/path/to/
-		//    buildkitd to inject a locally built binary into the container.
-		if isDockerWorker(sb) {
-			t.Skip("docker worker uses Docker's embedded BuildKit which does not yet support intermediate OCI images")
-		}
-		dest := t.TempDir()
-		out, err := buildCmd(sb, withArgs(
-			"--no-cache",
-			"--intermediate-images",
-			fmt.Sprintf("--output=type=oci,dest=%s,tar=false", dest),
-			dir,
-		))
-		require.Error(t, err, "expected build to fail")
-		_ = out
-
-		dt, err := os.ReadFile(filepath.Join(dest, "index.json"))
-		require.NoError(t, err)
-
-		var idx struct {
-			Manifests []json.RawMessage `json:"manifests"`
-		}
-		require.NoError(t, json.Unmarshal(dt, &idx))
-
-		readBlob := func(dgst digest.Digest) []byte {
-			dt, err := os.ReadFile(filepath.Join(dest, "blobs", dgst.Algorithm().String(), dgst.Encoded()))
-			require.NoError(t, err)
-			return dt
-		}
-
-		// On failure, only intermediate images are produced (no final image).
-		// Both the successful step and the failing step should appear.
-		expectedCommands := map[string]string{
-			"0": "/bin/sh -c touch /step1",
-			"1": "/bin/sh -c false",
-		}
-		stepsSeen := map[string]bool{}
-		for _, raw := range idx.Manifests {
-			var desc ocispecs.Descriptor
-			require.NoError(t, json.Unmarshal(raw, &desc))
-
-			require.NotContains(t, desc.Annotations, exptypes.ExporterConfigDigestKey,
-				"config.digest must not leak onto index descriptors")
-
-			stepIdx, ok := desc.Annotations[exptypes.ExporterIntermediateIndexKey]
-			require.True(t, ok, "all manifests should be intermediate images on build failure, got unannotated manifest")
-			require.False(t, stepsSeen[stepIdx], "duplicate step index %q in index", stepIdx)
-			stepsSeen[stepIdx] = true
-
-			require.Equal(t, expectedCommands[stepIdx],
-				desc.Annotations[exptypes.ExporterIntermediateStepCommandKey],
-				"command annotation mismatch on index descriptor for step %q", stepIdx)
-
-			// Verify both annotations are embedded in the manifest blob itself.
-			var mfst ocispecs.Manifest
-			require.NoError(t, json.Unmarshal(readBlob(desc.Digest), &mfst))
-			require.Equal(t, stepIdx, mfst.Annotations[exptypes.ExporterIntermediateIndexKey],
-				"manifest blob step annotation mismatch for step %q", stepIdx)
-			require.Equal(t, expectedCommands[stepIdx],
-				mfst.Annotations[exptypes.ExporterIntermediateStepCommandKey],
-				"manifest blob command annotation mismatch for step %q", stepIdx)
-		}
-		for _, expected := range []string{"0", "1"} {
-			require.True(t, stepsSeen[expected], "missing intermediate step index %q in index", expected)
-		}
-	})
+	}
 }
 
 func createTestProject(t *testing.T) string {
