@@ -100,6 +100,18 @@ func (w *remoteMultiNodeWorker) New(ctx context.Context, cfg *integration.Backen
 		return nil, nil, errors.Wrapf(err, "failed to bootstrap builder %s: %s", ctnBuilder1, string(out))
 	}
 
+	// If TEST_BUILDKITD_BIN is set, replace the buildkitd binary in each
+	// sub-builder container with the locally built (WIP) version, same as
+	// containerWorker.New() does for the docker-container worker.
+	if bkdBin := os.Getenv("TEST_BUILDKITD_BIN"); bkdBin != "" {
+		dockerEnv := append(os.Environ(), "DOCKER_CONTEXT="+w.docker.DockerAddress())
+		for _, builderName := range []string{ctnBuilder0, ctnBuilder1} {
+			if err := patchBuildkitd(ctx, driver.BuilderName(builderName)+"0", bkdBin, dockerEnv); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+
 	endpoint0 := fmt.Sprintf("docker-container://%s0", driver.BuilderName(ctnBuilder0))
 	endpoint1 := fmt.Sprintf("docker-container://%s0", driver.BuilderName(ctnBuilder1))
 	if out, err := run(ctx, "create", "--name="+name, "--driver=remote", endpoint0); err != nil {

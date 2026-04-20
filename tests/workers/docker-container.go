@@ -74,6 +74,17 @@ func (w *containerWorker) New(ctx context.Context, cfg *integration.BackendConfi
 		return nil, nil, errors.Wrapf(err, "failed to create buildx instance %s", name)
 	}
 
+	// If TEST_BUILDKITD_BIN is set, replace the buildkitd binary in the
+	// bootstrapped container with the locally built (WIP) version. The container
+	// is named buildx_buildkit_<name>0 (first node = builder name + "0").
+	if bkdBin := os.Getenv("TEST_BUILDKITD_BIN"); bkdBin != "" {
+		ctr := "buildx_buildkit_" + name + "0"
+		env := append(os.Environ(), "DOCKER_CONTEXT="+w.docker.DockerAddress())
+		if err := patchBuildkitd(ctx, ctr, bkdBin, env); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	cl := func() error {
 		cmd := exec.CommandContext(context.Background(), "buildx", "rm", "-f", name)
 		cmd.Env = append(
